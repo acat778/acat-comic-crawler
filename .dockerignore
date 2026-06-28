@@ -1,0 +1,10 @@
+node_modules/
+frontend/node_modules/
+downloads/
+data/
+.git/
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
