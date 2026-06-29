@@ -16,8 +16,17 @@ router.get('/search', async (req, res) => {
     if (!keyword || keyword.trim() === '') {
       return res.status(400).json({ error: 'keyword is required' })
     }
-    const result = await crawlerService.search(keyword.trim(), site)
-    res.json(result)
+    const timeout = setTimeout(() => {
+      res.status(408).json({ error: 'Search timed out (90s)' })
+    }, 90000)
+    try {
+      const result = await crawlerService.search(keyword.trim(), site)
+      clearTimeout(timeout)
+      res.json(result)
+    } catch (err) {
+      clearTimeout(timeout)
+      throw err
+    }
   } catch (err) {
     console.error('[Search] Error:', err.message)
     res.status(500).json({ error: err.message })

@@ -12,10 +12,15 @@ export default {
 
   jmcomic: {
     baseUrl: 'https://18comic.vip',
+    mirrors: [
+      'https://18comic.vip',
+      'https://18comic.ink',
+      'https://jmcomic-zzz.one',
+      'https://jmcomic-zzz.org',
+      'https://comic18j-codi.cc',
+      'https://comic18j-yodo.club',
+      'https://comic18j-codi.club',
+    ],
     defaultAdult: true,
-  },
-
-  google: {
-    searchUrl: 'https://www.google.com/search',
   },
 }

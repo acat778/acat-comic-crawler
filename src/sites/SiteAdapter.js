@@ -12,7 +12,10 @@ export class SiteAdapter {
     throw new Error('Not implemented: siteId')
   }
 
-  /** Search source site via Google. Returns [{ title, url, snippet }] */
+  /**
+   * Search source site directly (fallback when Google site-search returns empty).
+   * Returns [{ title, url, snippet }]
+   */
   async search(browser, keyword) {
     throw new Error('Not implemented: search')
   }

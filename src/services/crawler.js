@@ -1,8 +1,10 @@
 import fs from 'fs'
 import path from 'path'
+import axios from 'axios'
 import { v4 as uuidv4 } from 'uuid'
 import config from '../config.js'
-import { newPage, googleSearch } from './browser.js'
+import { getBrowser, newPage } from './browser.js'
+import { initClient } from './jmcomic-api.js'
 import { getAdapter } from '../sites/registry.js'
 import { storage } from '../store/storage.js'
 
@@ -46,8 +48,32 @@ async function downloadImage(page, imageUrl, savePath) {
 
 export const crawlerService = {
   async search(keyword, site = 'jmcomic') {
-    const results = await googleSearch(keyword)
-    return { results, hasMore: results.length >= 10 }
+    // JMComic mobile API — bypasses Cloudflare, returns structured data
+    console.log(`[Search] JMComic API for "${keyword}"...`)
+    try {
+      const client = await initClient()
+      const apiResult = await client.search(keyword, { page: 1 })
+
+      const total = parseInt(apiResult.total || '0', 10)
+      const items = apiResult.content || []
+      const results = items.map((item) => ({
+        title: item.name || '',
+        url: `https://${new URL(client.baseURL).hostname}/album/${item.id}`,
+        snippet: `作者: ${item.author || ''}`,
+      }))
+
+      console.log(`[Search] API returned ${results.length} results (total: ${total})`)
+      return { results, hasMore: results.length >= 30 }
+    } catch (err) {
+      console.error(`[Search] JMComic API failed: ${err.message}`)
+      return { results: [], hasMore: false }
+    }
+  },
+
+  /** Extract album ID from JMComic URL: /album/123456 or photo/123456 */
+  extractAlbumId(url) {
+    const m = url.match(/\/album\/(\d+)/) || url.match(/\/photo\/(\d+)/)
+    return m ? m[1] : null
   },
 
   async createTask(url, site = 'jmcomic') {
@@ -67,14 +93,175 @@ export const crawlerService = {
     storage.createTask(task)
     addLog(task.id, 'info', `Task created: ${url}`)
 
-    // Run async
-    this.runTask(task.id).catch((err) => {
-      console.error(`[Task ${task.id}] Fatal:`, err.message)
-      addLog(task.id, 'error', `Fatal: ${err.message}`)
-      storage.updateTask(task.id, { status: 'failed', lastError: err.message })
-    })
+    // Try API-based crawl for jmcomic; fall back to Puppeteer for others
+    const albumId = this.extractAlbumId(url)
+    if (site === 'jmcomic' && albumId) {
+      this.runApiTask(task.id, albumId).catch((err) => {
+        console.error(`[Task ${task.id}] API crawl fatal:`, err.message)
+        addLog(task.id, 'error', `Fatal: ${err.message}`)
+        storage.updateTask(task.id, { status: 'failed', lastError: err.message })
+      })
+    } else {
+      this.runTask(task.id).catch((err) => {
+        console.error(`[Task ${task.id}] Fatal:`, err.message)
+        addLog(task.id, 'error', `Fatal: ${err.message}`)
+        storage.updateTask(task.id, { status: 'failed', lastError: err.message })
+      })
+    }
 
     return task
+  },
+
+  async runApiTask(taskId, albumId) {
+    if (activeTasks.has(taskId)) return
+    const controller = new AbortController()
+    activeTasks.set(taskId, controller)
+
+    try {
+      storage.updateTask(taskId, { status: 'running' })
+      addLog(taskId, 'info', 'Starting API-based crawl...')
+
+      // Initialize API client
+      addLog(taskId, 'info', 'Connecting to JMComic API...')
+      const client = await initClient()
+      addLog(taskId, 'info', `API connected: ${client.baseURL}`)
+
+      // 1. Get album info (includes chapter list in `series`)
+      addLog(taskId, 'info', `Fetching album ${albumId}...`)
+      const album = await client.getAlbum(albumId)
+      const albumTitle = album.name || 'Unknown'
+      const chapters = (album.series || []).map((ch, i) => ({
+        title: ch.name || `第${ch.sort}話`,
+        url: `${client.baseURL}/album/${albumId}?chapter=${ch.id}`,
+        index: i,
+      }))
+
+      storage.updateTask(taskId, {
+        albumTitle,
+        albumInfo: { title: albumTitle, author: (album.author || []).join(', '), tags: album.tags || [] },
+        chapters: chapters.map((ch) => ({ ...ch, status: 'pending', pages: [] })),
+        progress: { total: chapters.length, done: 0, failed: 0 },
+      })
+      addLog(taskId, 'info', `Album: ${albumTitle} (${chapters.length} chapters)`)
+
+      if (chapters.length === 0) {
+        addLog(taskId, 'warn', 'No chapters found')
+        storage.updateTask(taskId, { status: 'failed', lastError: 'No chapters found' })
+        return
+      }
+
+      // 2. Process each chapter
+      const downloadDir = ensureDownloadDir(albumTitle)
+      let doneCount = 0
+      let failedCount = 0
+
+      for (let ci = 0; ci < chapters.length; ci++) {
+        if (controller.signal.aborted) break
+
+        const chapter = chapters[ci]
+        const chapterId = album.series[ci].id
+        addLog(taskId, 'info', `Chapter ${ci + 1}/${chapters.length}: ${chapter.title}`)
+
+        try {
+          // Get chapter images from API
+          const chapterData = await client.getChapter(chapterId)
+          const imageNames = chapterData.images || []
+
+          if (imageNames.length === 0) {
+            addLog(taskId, 'warn', `  No images for chapter ${chapterId}`)
+            failedCount++
+            continue
+          }
+
+          // Update chapter with pages
+          const updatedChapters = storage.getTask(taskId).chapters
+          const pageItems = imageNames.map((name, pi) => ({
+            pageNo: pi + 1,
+            imageUrl: `${client.imageBaseURL}/media/photos/${chapterId}/${name}`,
+            status: 'pending',
+          }))
+          updatedChapters[ci] = { ...updatedChapters[ci], status: 'processing', pages: pageItems }
+          storage.updateTask(taskId, { chapters: updatedChapters })
+
+          // Download each image
+          const chapterDir = path.join(downloadDir, `${ci + 1}`.padStart(3, '0'))
+          if (!fs.existsSync(chapterDir)) fs.mkdirSync(chapterDir, { recursive: true })
+
+          let chapterFailed = 0
+          for (const pageItem of pageItems) {
+            if (controller.signal.aborted) break
+            try {
+              const ext = pageItem.imageUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i)?.[1] || 'jpg'
+              const savePath = path.join(chapterDir, `${String(pageItem.pageNo).padStart(3, '0')}.${ext}`)
+
+              // Download via axios (CDN might not be behind Cloudflare)
+              const resp = await axios.get(pageItem.imageUrl, {
+                timeout: 30000,
+                responseType: 'arraybuffer',
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                  'Referer': client.baseURL,
+                },
+              })
+              fs.writeFileSync(savePath, Buffer.from(resp.data))
+              const size = fs.statSync(savePath).size
+
+              pageItem.status = 'downloaded'
+              pageItem.localPath = savePath
+              addLog(taskId, 'info', `  Page ${pageItem.pageNo}: ${(size / 1024).toFixed(1)}KB ✓`)
+              await sleep(500)
+            } catch (err) {
+              pageItem.status = 'failed'
+              pageItem.error = err.message
+              chapterFailed++
+              addLog(taskId, 'error', `  Page ${pageItem.pageNo}: ${err.message}`)
+            }
+          }
+
+          // Update chapter status
+          const finalChapters = storage.getTask(taskId).chapters
+          finalChapters[ci] = {
+            ...finalChapters[ci],
+            status: chapterFailed === 0 ? 'completed' : 'partial',
+            pages: pageItems,
+          }
+          if (chapterFailed === 0) doneCount++
+          else failedCount++
+
+          storage.updateTask(taskId, {
+            chapters: finalChapters,
+            progress: { total: chapters.length, done: doneCount, failed: failedCount },
+          })
+          addLog(taskId, 'info', `Chapter ${ci + 1} done: ${imageNames.length - chapterFailed}/${imageNames.length} images`)
+        } catch (err) {
+          failedCount++
+          addLog(taskId, 'error', `Chapter ${ci + 1} FAILED: ${err.message}`)
+          const errChapters = storage.getTask(taskId).chapters
+          errChapters[ci] = { ...errChapters[ci], status: 'failed', error: err.message }
+          storage.updateTask(taskId, {
+            chapters: errChapters,
+            progress: { total: chapters.length, done: doneCount, failed: failedCount },
+          })
+        }
+      }
+
+      const final = storage.getTask(taskId)
+      const allDone = final.chapters.every((ch) => ch.status === 'completed')
+      const someFailed = final.chapters.some((ch) => ch.status === 'failed' || ch.status === 'partial')
+      const status = controller.signal.aborted
+        ? 'cancelled'
+        : allDone ? 'completed'
+        : someFailed ? 'partial_failed'
+        : 'failed'
+
+      storage.updateTask(taskId, { status })
+      addLog(taskId, 'info', `Done: ${status}`)
+    } catch (err) {
+      addLog(taskId, 'error', err.message)
+      storage.updateTask(taskId, { status: 'failed', lastError: err.message })
+    } finally {
+      activeTasks.delete(taskId)
+    }
   },
 
   async runTask(taskId) {
