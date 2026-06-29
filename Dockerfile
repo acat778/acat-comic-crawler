@@ -30,6 +30,6 @@ RUN npm ci --omit=dev
 COPY src ./src
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
-EXPOSE 8006
+EXPOSE 8619
 
 CMD ["node", "src/server.js"]
