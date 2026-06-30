@@ -48,4 +48,19 @@ export const backendApi = {
     form.append('file', new Blob([fs.readFileSync(data.filePath)]), path.basename(data.filePath))
     return unwrap(await http.post('/pages/upload', form))
   },
+
+  async uploadCover(data) {
+    const form = new FormData()
+    form.append('albumId', data.albumId)
+    form.append('file', new Blob([fs.readFileSync(data.filePath)]), path.basename(data.filePath))
+    return unwrap(await http.post('/albums/cover/upload', form))
+  },
+
+  async deleteAlbum(albumId) {
+    return unwrap(await http.delete(`/albums/${albumId}`))
+  },
+
+  async deleteChapter(chapterId) {
+    return unwrap(await http.delete(`/chapters/${chapterId}`))
+  },
 }

@@ -70,6 +70,30 @@ router.post('/tasks/:id/cancel', async (req, res) => {
   }
 })
 
+// DELETE /api/crawler/tasks/:id
+// 删除任务，同时清理后端数据和本地下载文件
+router.delete('/tasks/:id', async (req, res) => {
+  try {
+    await crawlerService.deleteTask(req.params.id)
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[Tasks] Delete error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/crawler/tasks/:id/retry
+// 重试失败的任务，先删除已创建的后端章节再重新爬取
+router.post('/tasks/:id/retry', async (req, res) => {
+  try {
+    const task = await crawlerService.retryTask(req.params.id)
+    res.json(task)
+  } catch (err) {
+    console.error('[Tasks] Retry error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // GET /api/crawler/tasks/:id/logs
 router.get('/tasks/:id/logs', (req, res) => {
   const task = crawlerService.getTask(req.params.id)

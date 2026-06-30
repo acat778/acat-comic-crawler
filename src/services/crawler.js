@@ -96,6 +96,34 @@ async function uploadBackendPage(taskId, chapterId, pageItem, sourceChapterId) {
   return result.pageId
 }
 
+async function uploadBackendCover(taskId, coverImageUrl) {
+  const task = storage.getTask(taskId)
+  if (!coverImageUrl) {
+    addLog(taskId, 'info', 'No cover image URL, skipping cover upload')
+    return null
+  }
+  try {
+    const downloadDir = ensureDownloadDir(task.albumTitle)
+    const coverExt = coverImageUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i)?.[1] || 'jpg'
+    const coverPath = path.join(downloadDir, '_cover.' + coverExt)
+    const resp = await axios.get(coverImageUrl, {
+      timeout: 30000,
+      responseType: 'arraybuffer',
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    })
+    fs.writeFileSync(coverPath, Buffer.from(resp.data))
+    const result = await backendApi.uploadCover({
+      albumId: task.backendAlbumId,
+      filePath: coverPath,
+    })
+    addLog(taskId, 'info', `Cover uploaded: ${result.fileId}`)
+    return result.fileId
+  } catch (err) {
+    addLog(taskId, 'warn', `Cover upload skipped: ${err.message}`)
+    return null
+  }
+}
+
 async function downloadImage(page, imageUrl, savePath) {
   try {
     const response = await page.evaluate(async (url) => {
@@ -218,6 +246,12 @@ export const crawlerService = {
         author: (album.author || []).join(', '),
         description: album.description || '',
       })
+
+      // Upload cover image if available
+      const coverUrl = client.imageBaseURL
+        ? `${client.imageBaseURL}/media/albums/${albumId}/cover.jpg`
+        : null
+      await uploadBackendCover(taskId, coverUrl)
 
       if (chapters.length === 0) {
         addLog(taskId, 'warn', 'No chapters found')
@@ -365,6 +399,11 @@ export const crawlerService = {
         addLog(taskId, 'info', `Album: ${albumInfo.title}`)
         await upsertBackendAlbum(taskId, albumInfo)
 
+        // Upload cover if the adapter extracted a cover URL
+        if (albumInfo.coverUrl) {
+          await uploadBackendCover(taskId, albumInfo.coverUrl)
+        }
+
         // 2. Get chapters
         addLog(taskId, 'info', 'Fetching chapters...')
         const chapters = await adapter.getChapters(page)
@@ -491,6 +530,116 @@ export const crawlerService = {
     if (ctrl) ctrl.abort()
     storage.updateTask(taskId, { status: 'cancelled' })
     addLog(taskId, 'info', 'Task cancelled')
+    return storage.getTask(taskId)
+  },
+
+  async deleteTask(taskId) {
+    const task = storage.getTask(taskId)
+    if (!task) throw new Error('Task not found')
+
+    addLog(taskId, 'info', 'Deleting task...')
+
+    // 1. Cancel if running
+    if (activeTasks.has(taskId)) {
+      await this.cancelTask(taskId)
+    }
+
+    // 2. Delete backend chapters and album
+    if (task.backendAlbumId) {
+      addLog(taskId, 'info', 'Cleaning up backend data...')
+      for (const chapter of (task.chapters || [])) {
+        if (chapter.backendChapterId) {
+          try {
+            await backendApi.deleteChapter(chapter.backendChapterId)
+            addLog(taskId, 'info', `Deleted backend chapter: ${chapter.title}`)
+          } catch (err) {
+            addLog(taskId, 'warn', `Failed to delete chapter ${chapter.title}: ${err.message}`)
+          }
+        }
+      }
+      try {
+        await backendApi.deleteAlbum(task.backendAlbumId)
+        addLog(taskId, 'info', 'Deleted backend album')
+      } catch (err) {
+        addLog(taskId, 'warn', `Failed to delete album: ${err.message}`)
+      }
+    }
+
+    // 3. Delete local downloaded files
+    const safeName = task.albumTitle
+      ? task.albumTitle.replace(/[<>:"/\\|?*]/g, '_').substring(0, 60)
+      : null
+    if (safeName) {
+      const downloadDir = path.resolve(config.crawler.downloadDir, safeName)
+      if (fs.existsSync(downloadDir)) {
+        fs.rmSync(downloadDir, { recursive: true, force: true })
+        addLog(taskId, 'info', `Deleted local files: ${downloadDir}`)
+      }
+    }
+
+    // 4. Delete from tasks.json
+    storage.deleteTask(taskId)
+    console.log(`[Task ${taskId.substring(0, 8)}] Task deleted`)
+  },
+
+  async retryTask(taskId) {
+    const task = storage.getTask(taskId)
+    if (!task) throw new Error('Task not found')
+
+    if (task.status !== 'failed' && task.status !== 'partial_failed') {
+      throw new Error(`Task cannot be retried. Current status: ${task.status}`)
+    }
+
+    addLog(taskId, 'info', 'Retrying task...')
+
+    // 1. Delete chapters that were previously created in the backend
+    if (task.backendAlbumId && task.chapters && task.chapters.length > 0) {
+      addLog(taskId, 'info', 'Cleaning up previously created backend chapters...')
+      for (const chapter of task.chapters) {
+        if (chapter.backendChapterId) {
+          try {
+            await backendApi.deleteChapter(chapter.backendChapterId)
+            addLog(taskId, 'info', `Deleted chapter before retry: ${chapter.title}`)
+          } catch (err) {
+            addLog(taskId, 'warn', `Failed to delete chapter before retry: ${err.message}`)
+          }
+        }
+      }
+    }
+
+    // 2. Reset task state: mark all chapters as pending
+    const resetChapters = (task.chapters || []).map((ch) => ({
+      ...ch,
+      status: 'pending',
+      pages: (ch.pages || []).map((p) => ({ ...p, status: 'pending', error: null })),
+      error: null,
+      backendChapterId: null,
+    }))
+
+    storage.updateTask(taskId, {
+      status: 'retrying',
+      lastError: null,
+      chapters: resetChapters,
+      progress: { total: resetChapters.length, done: 0, failed: 0 },
+    })
+
+    // 3. Re-run from the beginning (upsertAlbum is idempotent, chapters deleted and re-created)
+    addLog(taskId, 'info', 'Restarting crawl...')
+    const albumId = task.sourceAlbumId
+    if (task.site === 'jmcomic' && albumId) {
+      this.runApiTask(taskId, albumId).catch((err) => {
+        console.error(`[Task ${taskId}] Retry API crawl fatal:`, err.message)
+        addLog(taskId, 'error', `Retry fatal: ${err.message}`)
+        storage.updateTask(taskId, { status: 'failed', lastError: err.message })
+      })
+    } else {
+      this.runTask(taskId).catch((err) => {
+        console.error(`[Task ${taskId}] Retry fatal:`, err.message)
+        addLog(taskId, 'error', `Retry fatal: ${err.message}`)
+        storage.updateTask(taskId, { status: 'failed', lastError: err.message })
+      })
+    }
+
     return storage.getTask(taskId)
   },
 
