@@ -8,6 +8,7 @@ import { initClient } from './jmcomic-api.js'
 import { backendApi, sha256File } from './backend-api.js'
 import { getAdapter } from '../sites/registry.js'
 import { storage } from '../store/storage.js'
+import { descramble } from './descramble.js'
 
 const activeTasks = new Map()
 
@@ -313,7 +314,17 @@ export const crawlerService = {
                   'Referer': client.baseURL,
                 },
               })
-              fs.writeFileSync(savePath, Buffer.from(resp.data))
+              let imageBuffer = Buffer.from(resp.data)
+
+              // Descramble JMComic scrambled images (based on album_id + filename hash)
+              const imageName = pageItem.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
+              try {
+                imageBuffer = await descramble(imageBuffer, albumId, imageName)
+              } catch (err) {
+                addLog(taskId, 'warn', `  Descramble failed for ${imageName}: ${err.message}, using original`)
+              }
+
+              fs.writeFileSync(savePath, imageBuffer)
               const size = fs.statSync(savePath).size
 
               pageItem.status = 'downloaded'
@@ -459,11 +470,27 @@ export const crawlerService = {
                 const ext = pi.imageUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i)?.[1] || 'jpg'
                 const savePath = path.join(chapterDir, `${String(pi.pageNo).padStart(3, '0')}.${ext}`)
                 const size = await downloadImage(page, pi.imageUrl, savePath)
+
+                // Descramble JMComic scrambled images (browser download path)
+                const task = storage.getTask(taskId)
+                let finalSize = size
+                if (task && task.sourceAlbumId) {
+                  try {
+                    const imgBuf = fs.readFileSync(savePath)
+                    const imgName = pi.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
+                    const descrambledBuf = await descramble(imgBuf, task.sourceAlbumId, imgName)
+                    fs.writeFileSync(savePath, descrambledBuf)
+                    finalSize = descrambledBuf.length
+                  } catch (err) {
+                    addLog(taskId, 'warn', `  Descramble failed for ${pi.pageNo}: ${err.message}, using original`)
+                  }
+                }
+
                 pi.status = 'downloaded'
                 pi.localPath = savePath
-                pi.fileSize = size
+                pi.fileSize = finalSize
                 await uploadBackendPage(taskId, backendChapterId, pi, chapter.url)
-                addLog(taskId, 'info', `  Page ${pi.pageNo}: ${(size / 1024).toFixed(1)}KB ✓`)
+                addLog(taskId, 'info', `  Page ${pi.pageNo}: ${(finalSize / 1024).toFixed(1)}KB ✓`)
                 await sleep(500)
               } catch (err) {
                 pi.status = 'failed'
