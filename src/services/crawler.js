@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from 'uuid'
 import config from '../config.js'
 import { getBrowser, newPage } from './browser.js'
 import { initClient } from './jmcomic-api.js'
+import { backendApi, sha256File } from './backend-api.js'
 import { getAdapter } from '../sites/registry.js'
 import { storage } from '../store/storage.js'
 
@@ -27,6 +28,72 @@ function addLog(taskId, level, message) {
   const logs = [...(task.logs || []), { level, message, time: new Date().toISOString() }]
   storage.updateTask(taskId, { logs })
   console.log(`[Task ${taskId.substring(0, 8)}] [${level}] ${message}`)
+}
+
+async function reportBackendStatus(taskId, status, lastError) {
+  const task = storage.getTask(taskId)
+  if (!task) return
+  try {
+    await backendApi.reportStatus({
+      taskId,
+      albumId: task.backendAlbumId || null,
+      sourceSite: task.site,
+      sourceAlbumId: task.sourceAlbumId || null,
+      status,
+      lastError: lastError || null,
+    })
+  } catch (err) {
+    addLog(taskId, 'warn', `Backend status report failed: ${err.message}`)
+  }
+}
+
+async function upsertBackendAlbum(taskId, albumInfo) {
+  const task = storage.getTask(taskId)
+  const result = await backendApi.upsertAlbum({
+    sourceSite: task.site,
+    sourceAlbumId: task.sourceAlbumId || null,
+    realSourceAlbumId: task.sourceAlbumId || null,
+    title: albumInfo.title,
+    authorName: albumInfo.author || '',
+    description: albumInfo.description || '',
+    defaultAdult: config.jmcomic.defaultAdult,
+  })
+  storage.updateTask(taskId, { backendAlbumId: result.albumId })
+  addLog(taskId, 'info', `Backend album ${result.created ? 'created' : 'reused'}: ${result.albumId}`)
+  return result.albumId
+}
+
+async function upsertBackendChapter(taskId, chapter, sortOrder, sourceChapterId) {
+  const task = storage.getTask(taskId)
+  const result = await backendApi.upsertChapter({
+    albumId: task.backendAlbumId,
+    sourceSite: task.site,
+    sourceAlbumId: task.sourceAlbumId || null,
+    sourceChapterId: sourceChapterId || null,
+    title: chapter.title,
+    sortOrder,
+  })
+  addLog(taskId, 'info', `Backend chapter ${result.created ? 'created' : 'reused'}: ${result.chapterId}`)
+  return result.chapterId
+}
+
+async function uploadBackendPage(taskId, chapterId, pageItem, sourceChapterId) {
+  const task = storage.getTask(taskId)
+  const sha256 = sha256File(pageItem.localPath)
+  const result = await backendApi.uploadPage({
+    albumId: task.backendAlbumId,
+    chapterId,
+    sourceSite: task.site,
+    sourceAlbumId: task.sourceAlbumId || null,
+    sourceChapterId: sourceChapterId || null,
+    pageNo: pageItem.pageNo,
+    sourceImageUrl: pageItem.imageUrl,
+    sha256,
+    filePath: pageItem.localPath,
+  })
+  pageItem.backendPageId = result.pageId
+  pageItem.sha256 = sha256
+  return result.pageId
 }
 
 async function downloadImage(page, imageUrl, savePath) {
@@ -77,13 +144,15 @@ export const crawlerService = {
   },
 
   async createTask(url, site = 'jmcomic') {
-    const task = {
+      const task = {
       id: uuidv4(),
       url,
       site,
       status: 'created',
       albumTitle: '',
       albumInfo: null,
+      sourceAlbumId: this.extractAlbumId(url),
+      backendAlbumId: null,
       chapters: [],
       progress: { total: 0, done: 0, failed: 0 },
       logs: [],
@@ -94,7 +163,7 @@ export const crawlerService = {
     addLog(task.id, 'info', `Task created: ${url}`)
 
     // Try API-based crawl for jmcomic; fall back to Puppeteer for others
-    const albumId = this.extractAlbumId(url)
+    const albumId = task.sourceAlbumId
     if (site === 'jmcomic' && albumId) {
       this.runApiTask(task.id, albumId).catch((err) => {
         console.error(`[Task ${task.id}] API crawl fatal:`, err.message)
@@ -119,6 +188,7 @@ export const crawlerService = {
 
     try {
       storage.updateTask(taskId, { status: 'running' })
+      await reportBackendStatus(taskId, 'running')
       addLog(taskId, 'info', 'Starting API-based crawl...')
 
       // Initialize API client
@@ -143,6 +213,11 @@ export const crawlerService = {
         progress: { total: chapters.length, done: 0, failed: 0 },
       })
       addLog(taskId, 'info', `Album: ${albumTitle} (${chapters.length} chapters)`)
+      await upsertBackendAlbum(taskId, {
+        title: albumTitle,
+        author: (album.author || []).join(', '),
+        description: album.description || '',
+      })
 
       if (chapters.length === 0) {
         addLog(taskId, 'warn', 'No chapters found')
@@ -163,6 +238,7 @@ export const crawlerService = {
         addLog(taskId, 'info', `Chapter ${ci + 1}/${chapters.length}: ${chapter.title}`)
 
         try {
+          const backendChapterId = await upsertBackendChapter(taskId, chapter, ci + 1, chapterId)
           // Get chapter images from API
           const chapterData = await client.getChapter(chapterId)
           const imageNames = chapterData.images || []
@@ -208,6 +284,7 @@ export const crawlerService = {
 
               pageItem.status = 'downloaded'
               pageItem.localPath = savePath
+              await uploadBackendPage(taskId, backendChapterId, pageItem, chapterId)
               addLog(taskId, 'info', `  Page ${pageItem.pageNo}: ${(size / 1024).toFixed(1)}KB ✓`)
               await sleep(500)
             } catch (err) {
@@ -255,10 +332,12 @@ export const crawlerService = {
         : 'failed'
 
       storage.updateTask(taskId, { status })
+      await reportBackendStatus(taskId, status)
       addLog(taskId, 'info', `Done: ${status}`)
     } catch (err) {
       addLog(taskId, 'error', err.message)
       storage.updateTask(taskId, { status: 'failed', lastError: err.message })
+      await reportBackendStatus(taskId, 'failed', err.message)
     } finally {
       activeTasks.delete(taskId)
     }
@@ -271,6 +350,7 @@ export const crawlerService = {
 
     try {
       storage.updateTask(taskId, { status: 'running' })
+      await reportBackendStatus(taskId, 'running')
       addLog(taskId, 'info', 'Starting crawl...')
 
       const task = storage.getTask(taskId)
@@ -283,6 +363,7 @@ export const crawlerService = {
         const albumInfo = await adapter.getAlbumInfo(page, task.url)
         storage.updateTask(taskId, { albumTitle: albumInfo.title, albumInfo })
         addLog(taskId, 'info', `Album: ${albumInfo.title}`)
+        await upsertBackendAlbum(taskId, albumInfo)
 
         // 2. Get chapters
         addLog(taskId, 'info', 'Fetching chapters...')
@@ -312,6 +393,7 @@ export const crawlerService = {
           addLog(taskId, 'info', `Chapter ${ci + 1}/${chapters.length}: ${chapter.title.substring(0, 60)}`)
 
           try {
+            const backendChapterId = await upsertBackendChapter(taskId, chapter, ci + 1, chapter.url)
             await page.goto(chapter.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
             await sleep(config.crawler.requestDelay)
 
@@ -341,6 +423,7 @@ export const crawlerService = {
                 pi.status = 'downloaded'
                 pi.localPath = savePath
                 pi.fileSize = size
+                await uploadBackendPage(taskId, backendChapterId, pi, chapter.url)
                 addLog(taskId, 'info', `  Page ${pi.pageNo}: ${(size / 1024).toFixed(1)}KB ✓`)
                 await sleep(500)
               } catch (err) {
@@ -392,10 +475,12 @@ export const crawlerService = {
         : 'failed'
 
       storage.updateTask(taskId, { status })
+      await reportBackendStatus(taskId, status)
       addLog(taskId, 'info', `Done: ${status}`)
     } catch (err) {
       addLog(taskId, 'error', err.message)
       storage.updateTask(taskId, { status: 'failed', lastError: err.message })
+      await reportBackendStatus(taskId, 'failed', err.message)
     } finally {
       activeTasks.delete(taskId)
     }

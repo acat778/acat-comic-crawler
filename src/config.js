@@ -8,6 +8,7 @@ export default {
     dataDir: process.env.DATA_DIR || './data',
     concurrency: parseInt(process.env.CRAWLER_CONCURRENCY, 10) || 2,
     requestDelay: parseInt(process.env.REQUEST_DELAY, 10) || 2000,
+    apiBaseUrl: process.env.CRAWLER_API_BASE_URL || 'http://localhost:9650/api/comic/crawler',
   },
 
   jmcomic: {
