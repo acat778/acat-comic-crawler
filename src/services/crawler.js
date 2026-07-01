@@ -23,6 +23,86 @@ function ensureDownloadDir(albumTitle) {
   return dir
 }
 
+function getTaskDownloadDir(task) {
+  if (!task?.albumTitle) return null
+  const safeName = task.albumTitle.replace(/[<>:"/\\|?*]/g, '_').substring(0, 60)
+  return path.resolve(config.crawler.downloadDir, safeName)
+}
+
+function hasRemoteUpload(task) {
+  if (!task) return false
+  if (task.backendCoverFileId || task.backendAlbumId) return true
+  return (task.chapters || []).some((chapter) => (
+    chapter.backendChapterId || (chapter.pages || []).some((page) => page.backendPageImageId || page.backendPageId)
+  ))
+}
+
+function calculateProgress(chapters) {
+  return {
+    total: chapters.length,
+    done: chapters.filter((chapter) => chapter.status === 'completed').length,
+    failed: chapters.filter((chapter) => chapter.status === 'failed' || chapter.status === 'partial').length,
+  }
+}
+
+function normalizeChapterIndexes(task, requestedIndexes) {
+  const chapters = task.chapters || []
+  if (!requestedIndexes || requestedIndexes.length === 0) {
+    return chapters.map((_chapter, index) => index)
+  }
+
+  const uniqueIndexes = [...new Set(requestedIndexes.map((value) => Number(value)))]
+  for (const index of uniqueIndexes) {
+    if (!Number.isInteger(index) || index < 0 || index >= chapters.length) {
+      throw new Error(`Invalid chapter index: ${index}`)
+    }
+  }
+  return uniqueIndexes
+}
+
+function toIndexSet(indexes) {
+  return indexes && indexes.length > 0 ? new Set(indexes) : null
+}
+
+function mergeChaptersForRun(currentChapters, nextChapters, retryIndexes) {
+  return nextChapters.map((chapter, index) => {
+    const existing = currentChapters[index]
+    if (retryIndexes && !retryIndexes.has(index)) {
+      return existing
+        ? { ...existing, title: chapter.title, url: chapter.url, index: chapter.index }
+        : { ...chapter, status: 'pending', pages: [] }
+    }
+    return {
+      ...chapter,
+      status: 'pending',
+      pages: [],
+      backendChapterId: null,
+      error: null,
+    }
+  })
+}
+
+function removeTaskLocalFiles(task) {
+  const downloadDir = getTaskDownloadDir(task)
+  if (!downloadDir || !fs.existsSync(downloadDir)) return null
+  fs.rmSync(downloadDir, { recursive: true, force: true })
+  return downloadDir
+}
+
+function removeChapterLocalFiles(task, chapterIndexes) {
+  const downloadDir = getTaskDownloadDir(task)
+  if (!downloadDir || !fs.existsSync(downloadDir)) return []
+  const removed = []
+  for (const index of chapterIndexes) {
+    const chapterDir = path.join(downloadDir, `${index + 1}`.padStart(3, '0'))
+    if (fs.existsSync(chapterDir)) {
+      fs.rmSync(chapterDir, { recursive: true, force: true })
+      removed.push(chapterDir)
+    }
+  }
+  return removed
+}
+
 function addLog(taskId, level, message) {
   const task = storage.getTask(taskId)
   if (!task) return
@@ -92,9 +172,9 @@ async function uploadBackendPage(taskId, chapterId, pageItem, sourceChapterId) {
     sha256,
     filePath: pageItem.localPath,
   })
-  pageItem.backendPageId = result.pageId
+  pageItem.backendPageImageId = result.pageImageId || result.pageId
   pageItem.sha256 = sha256
-  return result.pageId
+  return pageItem.backendPageImageId
 }
 
 async function uploadBackendCover(taskId, coverImageUrl) {
@@ -102,6 +182,10 @@ async function uploadBackendCover(taskId, coverImageUrl) {
   if (!coverImageUrl) {
     addLog(taskId, 'info', 'No cover image URL, skipping cover upload')
     return null
+  }
+  if (task.backendCoverFileId) {
+    addLog(taskId, 'info', `Cover already uploaded: ${task.backendCoverFileId}`)
+    return task.backendCoverFileId
   }
   try {
     const downloadDir = ensureDownloadDir(task.albumTitle)
@@ -117,6 +201,7 @@ async function uploadBackendCover(taskId, coverImageUrl) {
       albumId: task.backendAlbumId,
       filePath: coverPath,
     })
+    storage.updateTask(taskId, { backendCoverFileId: result.fileId })
     addLog(taskId, 'info', `Cover uploaded: ${result.fileId}`)
     return result.fileId
   } catch (err) {
@@ -182,6 +267,7 @@ export const crawlerService = {
       albumInfo: null,
       sourceAlbumId: this.extractAlbumId(url),
       backendAlbumId: null,
+      backendCoverFileId: null,
       chapters: [],
       progress: { total: 0, done: 0, failed: 0 },
       logs: [],
@@ -210,10 +296,11 @@ export const crawlerService = {
     return task
   },
 
-  async runApiTask(taskId, albumId) {
+  async runApiTask(taskId, albumId, options = {}) {
     if (activeTasks.has(taskId)) return
     const controller = new AbortController()
     activeTasks.set(taskId, controller)
+    const retryIndexes = toIndexSet(options.chapterIndexes)
 
     try {
       storage.updateTask(taskId, { status: 'running' })
@@ -235,11 +322,13 @@ export const crawlerService = {
         index: i,
       }))
 
+      const currentTask = storage.getTask(taskId)
+      const runChapters = mergeChaptersForRun(currentTask.chapters || [], chapters, retryIndexes)
       storage.updateTask(taskId, {
         albumTitle,
         albumInfo: { title: albumTitle, author: (album.author || []).join(', '), tags: album.tags || [] },
-        chapters: chapters.map((ch) => ({ ...ch, status: 'pending', pages: [] })),
-        progress: { total: chapters.length, done: 0, failed: 0 },
+        chapters: runChapters,
+        progress: calculateProgress(runChapters),
       })
       addLog(taskId, 'info', `Album: ${albumTitle} (${chapters.length} chapters)`)
       await upsertBackendAlbum(taskId, {
@@ -262,11 +351,9 @@ export const crawlerService = {
 
       // 2. Process each chapter
       const downloadDir = ensureDownloadDir(albumTitle)
-      let doneCount = 0
-      let failedCount = 0
-
       for (let ci = 0; ci < chapters.length; ci++) {
         if (controller.signal.aborted) break
+        if (retryIndexes && !retryIndexes.has(ci)) continue
 
         const chapter = chapters[ci]
         const chapterId = album.series[ci].id
@@ -274,13 +361,25 @@ export const crawlerService = {
 
         try {
           const backendChapterId = await upsertBackendChapter(taskId, chapter, ci + 1, chapterId)
+          const backendChapters = storage.getTask(taskId).chapters
+          backendChapters[ci] = {
+            ...backendChapters[ci],
+            backendChapterId,
+            sourceChapterId: chapterId,
+          }
+          storage.updateTask(taskId, { chapters: backendChapters })
           // Get chapter images from API
           const chapterData = await client.getChapter(chapterId)
           const imageNames = chapterData.images || []
 
           if (imageNames.length === 0) {
             addLog(taskId, 'warn', `  No images for chapter ${chapterId}`)
-            failedCount++
+            const emptyChapters = storage.getTask(taskId).chapters
+            emptyChapters[ci] = { ...emptyChapters[ci], status: 'failed', error: 'No images found' }
+            storage.updateTask(taskId, {
+              chapters: emptyChapters,
+              progress: calculateProgress(emptyChapters),
+            })
             continue
           }
 
@@ -347,22 +446,18 @@ export const crawlerService = {
             status: chapterFailed === 0 ? 'completed' : 'partial',
             pages: pageItems,
           }
-          if (chapterFailed === 0) doneCount++
-          else failedCount++
-
           storage.updateTask(taskId, {
             chapters: finalChapters,
-            progress: { total: chapters.length, done: doneCount, failed: failedCount },
+            progress: calculateProgress(finalChapters),
           })
           addLog(taskId, 'info', `Chapter ${ci + 1} done: ${imageNames.length - chapterFailed}/${imageNames.length} images`)
         } catch (err) {
-          failedCount++
           addLog(taskId, 'error', `Chapter ${ci + 1} FAILED: ${err.message}`)
           const errChapters = storage.getTask(taskId).chapters
           errChapters[ci] = { ...errChapters[ci], status: 'failed', error: err.message }
           storage.updateTask(taskId, {
             chapters: errChapters,
-            progress: { total: chapters.length, done: doneCount, failed: failedCount },
+            progress: calculateProgress(errChapters),
           })
         }
       }
@@ -388,10 +483,11 @@ export const crawlerService = {
     }
   },
 
-  async runTask(taskId) {
+  async runTask(taskId, options = {}) {
     if (activeTasks.has(taskId)) return
     const controller = new AbortController()
     activeTasks.set(taskId, controller)
+    const retryIndexes = toIndexSet(options.chapterIndexes)
 
     try {
       storage.updateTask(taskId, { status: 'running' })
@@ -424,26 +520,33 @@ export const crawlerService = {
           return
         }
 
+        const currentTask = storage.getTask(taskId)
+        const runChapters = mergeChaptersForRun(currentTask.chapters || [], chapters, retryIndexes)
         storage.updateTask(taskId, {
-          chapters: chapters.map((ch) => ({ ...ch, status: 'pending', pages: [] })),
-          progress: { total: chapters.length, done: 0, failed: 0 },
+          chapters: runChapters,
+          progress: calculateProgress(runChapters),
         })
         addLog(taskId, 'info', `Found ${chapters.length} chapters`)
 
         // 3. Process each chapter
         const downloadDir = ensureDownloadDir(albumInfo.title)
         addLog(taskId, 'info', `Download dir: ${downloadDir}`)
-        let doneCount = 0
-        let failedCount = 0
-
         for (let ci = 0; ci < chapters.length; ci++) {
           if (controller.signal.aborted) break
+          if (retryIndexes && !retryIndexes.has(ci)) continue
 
           const chapter = chapters[ci]
           addLog(taskId, 'info', `Chapter ${ci + 1}/${chapters.length}: ${chapter.title.substring(0, 60)}`)
 
           try {
             const backendChapterId = await upsertBackendChapter(taskId, chapter, ci + 1, chapter.url)
+            const backendChapters = storage.getTask(taskId).chapters
+            backendChapters[ci] = {
+              ...backendChapters[ci],
+              backendChapterId,
+              sourceChapterId: chapter.url,
+            }
+            storage.updateTask(taskId, { chapters: backendChapters })
             await page.goto(chapter.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
             await sleep(config.crawler.requestDelay)
 
@@ -508,22 +611,18 @@ export const crawlerService = {
               pages: pageImages,
             }
 
-            if (chapterFailed === 0) doneCount++
-            else failedCount++
-
             storage.updateTask(taskId, {
               chapters: finalChapters,
-              progress: { total: chapters.length, done: doneCount, failed: failedCount },
+              progress: calculateProgress(finalChapters),
             })
             addLog(taskId, 'info', `Chapter ${ci + 1} done: ${pageImages.length - chapterFailed}/${pageImages.length} images`)
           } catch (err) {
-            failedCount++
             addLog(taskId, 'error', `Chapter ${ci + 1} FAILED: ${err.message}`)
             const errChapters = storage.getTask(taskId).chapters
             errChapters[ci] = { ...errChapters[ci], status: 'failed', error: err.message }
             storage.updateTask(taskId, {
               chapters: errChapters,
-              progress: { total: chapters.length, done: doneCount, failed: failedCount },
+              progress: calculateProgress(errChapters),
             })
           }
         }
@@ -560,9 +659,11 @@ export const crawlerService = {
     return storage.getTask(taskId)
   },
 
-  async deleteTask(taskId) {
+  async deleteTask(taskId, options = {}) {
     const task = storage.getTask(taskId)
     if (!task) throw new Error('Task not found')
+    const deleteRemote = options.deleteRemote !== false
+    const hadRemoteUpload = hasRemoteUpload(task)
 
     addLog(taskId, 'info', 'Deleting task...')
 
@@ -571,96 +672,121 @@ export const crawlerService = {
       await this.cancelTask(taskId)
     }
 
-    // 2. Delete backend chapters and album
-    if (task.backendAlbumId) {
+    // 2. Delete backend data and RustFS objects only when explicitly requested.
+    if (hadRemoteUpload && deleteRemote) {
       addLog(taskId, 'info', 'Cleaning up backend data...')
-      for (const chapter of (task.chapters || [])) {
-        if (chapter.backendChapterId) {
-          try {
-            await backendApi.deleteChapter(chapter.backendChapterId)
-            addLog(taskId, 'info', `Deleted backend chapter: ${chapter.title}`)
-          } catch (err) {
-            addLog(taskId, 'warn', `Failed to delete chapter ${chapter.title}: ${err.message}`)
+      if (task.backendAlbumId) {
+        try {
+          await backendApi.deleteAlbum(task.backendAlbumId)
+          addLog(taskId, 'info', 'Deleted backend album and RustFS files')
+        } catch (err) {
+          addLog(taskId, 'warn', `Failed to delete album: ${err.message}`)
+        }
+      } else {
+        for (const chapter of (task.chapters || [])) {
+          if (chapter.backendChapterId) {
+            try {
+              await backendApi.deleteChapter(chapter.backendChapterId)
+              addLog(taskId, 'info', `Deleted backend chapter: ${chapter.title}`)
+            } catch (err) {
+              addLog(taskId, 'warn', `Failed to delete chapter ${chapter.title}: ${err.message}`)
+            }
           }
         }
       }
-      try {
-        await backendApi.deleteAlbum(task.backendAlbumId)
-        addLog(taskId, 'info', 'Deleted backend album')
-      } catch (err) {
-        addLog(taskId, 'warn', `Failed to delete album: ${err.message}`)
-      }
+    } else if (hadRemoteUpload) {
+      addLog(taskId, 'info', 'Backend/RustFS data preserved by delete option')
     }
 
     // 3. Delete local downloaded files
-    const safeName = task.albumTitle
-      ? task.albumTitle.replace(/[<>:"/\\|?*]/g, '_').substring(0, 60)
-      : null
-    if (safeName) {
-      const downloadDir = path.resolve(config.crawler.downloadDir, safeName)
-      if (fs.existsSync(downloadDir)) {
-        fs.rmSync(downloadDir, { recursive: true, force: true })
-        addLog(taskId, 'info', `Deleted local files: ${downloadDir}`)
-      }
+    const deletedLocalDir = removeTaskLocalFiles(task)
+    if (deletedLocalDir) {
+      addLog(taskId, 'info', `Deleted local files: ${deletedLocalDir}`)
     }
 
     // 4. Delete from tasks.json
     storage.deleteTask(taskId)
     console.log(`[Task ${taskId.substring(0, 8)}] Task deleted`)
+    return { success: true, hadRemoteUpload, remoteDeleted: hadRemoteUpload && deleteRemote, localDeleted: Boolean(deletedLocalDir) }
   },
 
-  async retryTask(taskId) {
+  async retryTask(taskId, options = {}) {
     const task = storage.getTask(taskId)
     if (!task) throw new Error('Task not found')
 
-    if (task.status !== 'failed' && task.status !== 'partial_failed') {
-      throw new Error(`Task cannot be retried. Current status: ${task.status}`)
+    if (activeTasks.has(taskId) || task.status === 'running' || task.status === 'retrying') {
+      throw new Error(`Task cannot be retried while running. Current status: ${task.status}`)
     }
 
-    addLog(taskId, 'info', 'Retrying task...')
+    const chapterIndexes = normalizeChapterIndexes(task, options.chapterIndexes)
+    const retryAll = chapterIndexes.length === (task.chapters || []).length
+    const missingBackendChapter = chapterIndexes.some((index) => !task.chapters[index]?.backendChapterId)
+    if (missingBackendChapter && task.backendAlbumId && !retryAll) {
+      throw new Error('部分章节缺少后端章节ID，无法安全清理指定章节；请执行整本重试')
+    }
+    addLog(taskId, 'info', retryAll ? 'Retrying all chapters...' : `Retrying chapters: ${chapterIndexes.map((i) => i + 1).join(', ')}`)
 
-    // 1. Delete chapters that were previously created in the backend
-    if (task.backendAlbumId && task.chapters && task.chapters.length > 0) {
-      addLog(taskId, 'info', 'Cleaning up previously created backend chapters...')
-      for (const chapter of task.chapters) {
-        if (chapter.backendChapterId) {
+    // 1. Delete selected chapters from backend. The backend cascades MySQL page records,
+    // file records and RustFS objects for the chapter.
+    const deleteAlbumBeforeRetry = missingBackendChapter && retryAll && task.backendAlbumId
+    if (deleteAlbumBeforeRetry) {
+      addLog(taskId, 'info', 'Chapter IDs are missing; deleting backend album before full retry...')
+      await backendApi.deleteAlbum(task.backendAlbumId)
+      storage.updateTask(taskId, { backendAlbumId: null, backendCoverFileId: null })
+      addLog(taskId, 'info', 'Deleted backend album before full retry')
+    } else {
+      addLog(taskId, 'info', 'Cleaning up backend chapters before retry...')
+      for (const index of chapterIndexes) {
+        const chapter = task.chapters[index]
+        if (chapter?.backendChapterId) {
           try {
             await backendApi.deleteChapter(chapter.backendChapterId)
-            addLog(taskId, 'info', `Deleted chapter before retry: ${chapter.title}`)
+            addLog(taskId, 'info', `Deleted backend chapter before retry: ${chapter.title}`)
           } catch (err) {
-            addLog(taskId, 'warn', `Failed to delete chapter before retry: ${err.message}`)
+            addLog(taskId, 'warn', `Failed to delete chapter before retry: ${chapter.title || index + 1}: ${err.message}`)
           }
         }
       }
     }
 
-    // 2. Reset task state: mark all chapters as pending
-    const resetChapters = (task.chapters || []).map((ch) => ({
-      ...ch,
-      status: 'pending',
-      pages: (ch.pages || []).map((p) => ({ ...p, status: 'pending', error: null })),
-      error: null,
-      backendChapterId: null,
-    }))
+    // 2. Remove selected local chapter files before re-downloading.
+    const removedDirs = removeChapterLocalFiles(task, chapterIndexes)
+    for (const removedDir of removedDirs) {
+      addLog(taskId, 'info', `Deleted local chapter files: ${removedDir}`)
+    }
+
+    // 3. Reset selected chapters only.
+    const retryIndexSet = new Set(chapterIndexes)
+    const resetChapters = (task.chapters || []).map((chapter, index) => {
+      if (!retryIndexSet.has(index)) return chapter
+      return {
+        ...chapter,
+        status: 'pending',
+        pages: [],
+        error: null,
+        backendChapterId: null,
+      }
+    })
 
     storage.updateTask(taskId, {
       status: 'retrying',
       lastError: null,
       chapters: resetChapters,
-      progress: { total: resetChapters.length, done: 0, failed: 0 },
+      progress: calculateProgress(resetChapters),
+      ...(deleteAlbumBeforeRetry ? { backendAlbumId: null, backendCoverFileId: null } : {}),
     })
 
-    // 3. Re-run from the beginning (upsertAlbum is idempotent, chapters deleted and re-created)
+    // 4. Re-run selected chapters. upsertAlbum is idempotent; selected chapters are re-created.
     addLog(taskId, 'info', 'Restarting crawl...')
     const albumId = task.sourceAlbumId
     if (task.site === 'jmcomic' && albumId) {
-      this.runApiTask(taskId, albumId).catch((err) => {
+      this.runApiTask(taskId, albumId, { chapterIndexes }).catch((err) => {
         console.error(`[Task ${taskId}] Retry API crawl fatal:`, err.message)
         addLog(taskId, 'error', `Retry fatal: ${err.message}`)
         storage.updateTask(taskId, { status: 'failed', lastError: err.message })
       })
     } else {
-      this.runTask(taskId).catch((err) => {
+      this.runTask(taskId, { chapterIndexes }).catch((err) => {
         console.error(`[Task ${taskId}] Retry fatal:`, err.message)
         addLog(taskId, 'error', `Retry fatal: ${err.message}`)
         storage.updateTask(taskId, { status: 'failed', lastError: err.message })
@@ -671,10 +797,11 @@ export const crawlerService = {
   },
 
   getTask(taskId) {
-    return storage.getTask(taskId)
+    const task = storage.getTask(taskId)
+    return task ? { ...task, hasRemoteUpload: hasRemoteUpload(task) } : null
   },
 
   listTasks() {
-    return storage.listTasks()
+    return storage.listTasks().map((task) => ({ ...task, hasRemoteUpload: hasRemoteUpload(task) }))
   },
 }

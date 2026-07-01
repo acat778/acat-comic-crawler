@@ -1,26 +1,34 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
-  Button, Input, Table, Tag, Tabs, Progress, message, Space, Card, Modal, Descriptions, Typography,
+  Button, Input, Table, Tag, Tabs, Progress, message, Space, Card, Modal, Descriptions, Typography, Radio, Alert,
 } from 'antd'
 import {
   SearchOutlined, DownloadOutlined, StopOutlined, ReloadOutlined, CheckCircleOutlined,
-  CloseCircleOutlined, SyncOutlined, ClockCircleOutlined,
+  CloseCircleOutlined, SyncOutlined, ClockCircleOutlined, DeleteOutlined,
 } from '@ant-design/icons'
 
 const API = '/api/crawler'
 
 interface SearchResult { title: string; url: string; snippet: string }
 interface TaskLog { level: string; message: string; time: string }
-interface TaskChapter { title: string; url: string; status: string; pages: Array<{ pageNo: number; status: string }> }
+interface TaskChapter {
+  title: string;
+  url: string;
+  status: string;
+  backendChapterId?: string;
+  error?: string;
+  pages: Array<{ pageNo: number; status: string; backendPageImageId?: string }>;
+}
 interface Task {
   id: string; url: string; site: string; status: string; albumTitle: string;
   chapters: TaskChapter[]; progress: { total: number; done: number; failed: number };
-  logs: TaskLog[]; lastError?: string; createdAt: string; updatedAt: string;
+  logs: TaskLog[]; lastError?: string; createdAt: string; updatedAt: string; hasRemoteUpload?: boolean;
 }
 
 const STATUS_MAP: Record<string, { color: string; icon: React.ReactNode; text: string }> = {
   created: { color: 'default', icon: <ClockCircleOutlined />, text: '已创建' },
   running: { color: 'processing', icon: <SyncOutlined spin />, text: '运行中' },
+  retrying: { color: 'processing', icon: <SyncOutlined spin />, text: '重试中' },
   completed: { color: 'green', icon: <CheckCircleOutlined />, text: '已完成' },
   partial_failed: { color: 'warning', icon: <CheckCircleOutlined />, text: '部分失败' },
   failed: { color: 'red', icon: <CloseCircleOutlined />, text: '失败' },
@@ -34,8 +42,11 @@ function App() {
   const [results, setResults] = useState<SearchResult[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<Task | null>(null)
+  const [deleteRemote, setDeleteRemote] = useState(true)
   const [logModal, setLogModal] = useState<TaskLog[]>([])
   const [loadingTasks, setLoadingTasks] = useState(false)
+  const [actionLoading, setActionLoading] = useState(false)
 
   const fetchTasks = useCallback(async () => {
     try {
@@ -85,12 +96,60 @@ function App() {
     fetchTasks()
   }
 
+  const handleRetry = async (task: Task, chapterIndex?: number) => {
+    setActionLoading(true)
+    try {
+      const res = await fetch(`${API}/tasks/${task.id}/retry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(chapterIndex === undefined ? {} : { chapterIndexes: [chapterIndex] }),
+      })
+      const data = await res.json()
+      if (data.error) message.error(data.error)
+      else {
+        message.success(chapterIndex === undefined ? '整本重试已启动' : '章节重试已启动')
+        fetchTasks()
+        if (selectedTask?.id === task.id) setSelectedTask(data)
+      }
+    } catch {
+      message.error('重试失败')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  const openDeleteModal = (task: Task) => {
+    setDeleteRemote(Boolean(task.hasRemoteUpload))
+    setDeleteTarget(task)
+  }
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return
+    setActionLoading(true)
+    try {
+      const res = await fetch(`${API}/tasks/${deleteTarget.id}?deleteRemote=${deleteRemote}`, { method: 'DELETE' })
+      const data = await res.json()
+      if (data.error) message.error(data.error)
+      else {
+        message.success(deleteRemote && deleteTarget.hasRemoteUpload ? '任务、本地文件和远端文件已删除' : '任务和本地文件已删除')
+        if (selectedTask?.id === deleteTarget.id) setSelectedTask(null)
+        setDeleteTarget(null)
+        fetchTasks()
+      }
+    } catch {
+      message.error('删除失败')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
   const showLogs = async (id: string) => {
     const res = await fetch(`${API}/tasks/${id}/logs`)
     setLogModal(await res.json())
   }
 
   const showDetail = (task: Task) => setSelectedTask(task)
+  const isBusy = (task: Task) => task.status === 'running' || task.status === 'retrying'
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: 24 }}>
@@ -178,9 +237,13 @@ function App() {
                     <Space>
                       <Button size="small" onClick={() => showDetail(r)}>详情</Button>
                       <Button size="small" onClick={() => showLogs(r.id)}>日志</Button>
+                      {!isBusy(r) && (
+                        <Button size="small" icon={<ReloadOutlined />} loading={actionLoading} onClick={() => handleRetry(r)}>重试</Button>
+                      )}
                       {r.status === 'running' && (
                         <Button size="small" danger icon={<StopOutlined />} onClick={() => handleCancel(r.id)}>取消</Button>
                       )}
+                      <Button size="small" danger icon={<DeleteOutlined />} loading={actionLoading} onClick={() => openDeleteModal(r)}>删除</Button>
                     </Space>
                   ),
                 },
@@ -200,20 +263,82 @@ function App() {
         destroyOnHidden
       >
         {selectedTask && (
-          <Descriptions column={2} bordered size="small">
-            <Descriptions.Item label="ID">{selectedTask.id?.substring(0, 20)}</Descriptions.Item>
-            <Descriptions.Item label="状态">
-              <Tag color={STATUS_MAP[selectedTask.status]?.color}>{STATUS_MAP[selectedTask.status]?.text}</Tag>
-            </Descriptions.Item>
-            <Descriptions.Item label="标题" span={2}>{selectedTask.albumTitle}</Descriptions.Item>
-            <Descriptions.Item label="URL" span={2}>{selectedTask.url}</Descriptions.Item>
-            <Descriptions.Item label="章节">{selectedTask.progress.done}/{selectedTask.progress.total}</Descriptions.Item>
-            <Descriptions.Item label="失败">{selectedTask.progress.failed}</Descriptions.Item>
-            {selectedTask.lastError && (
-              <Descriptions.Item label="错误" span={2}><span style={{ color: 'red' }}>{selectedTask.lastError}</span></Descriptions.Item>
-            )}
-          </Descriptions>
+          <>
+            <Descriptions column={2} bordered size="small">
+              <Descriptions.Item label="ID">{selectedTask.id?.substring(0, 20)}</Descriptions.Item>
+              <Descriptions.Item label="状态">
+                <Tag color={STATUS_MAP[selectedTask.status]?.color}>{STATUS_MAP[selectedTask.status]?.text}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="标题" span={2}>{selectedTask.albumTitle}</Descriptions.Item>
+              <Descriptions.Item label="URL" span={2}>{selectedTask.url}</Descriptions.Item>
+              <Descriptions.Item label="章节">{selectedTask.progress.done}/{selectedTask.progress.total}</Descriptions.Item>
+              <Descriptions.Item label="失败">{selectedTask.progress.failed}</Descriptions.Item>
+              <Descriptions.Item label="远端数据">{selectedTask.hasRemoteUpload ? '已上传' : '未检测到'}</Descriptions.Item>
+              {selectedTask.lastError && (
+                <Descriptions.Item label="错误" span={2}><span style={{ color: 'red' }}>{selectedTask.lastError}</span></Descriptions.Item>
+              )}
+            </Descriptions>
+            <Typography.Title level={5} style={{ marginTop: 16 }}>章节</Typography.Title>
+            <Table<TaskChapter & { chapterIndex: number }>
+              size="small"
+              pagination={{ pageSize: 8 }}
+              rowKey={(record) => `${record.chapterIndex}-${record.title}`}
+              dataSource={(selectedTask.chapters || []).map((chapter, chapterIndex) => ({ ...chapter, chapterIndex }))}
+              columns={[
+                { title: '序号', dataIndex: 'chapterIndex', width: 70, render: (value: number) => value + 1 },
+                { title: '标题', dataIndex: 'title', ellipsis: true },
+                {
+                  title: '状态', dataIndex: 'status', width: 110,
+                  render: (status: string) => {
+                    const item = STATUS_MAP[status] || { color: 'default', text: status }
+                    return <Tag color={item.color}>{item.text}</Tag>
+                  },
+                },
+                { title: '页数', width: 80, render: (_: unknown, record) => record.pages?.length || 0 },
+                {
+                  title: '操作', width: 110,
+                  render: (_: unknown, record) => (
+                    <Button
+                      size="small"
+                      icon={<ReloadOutlined />}
+                      disabled={isBusy(selectedTask)}
+                      loading={actionLoading}
+                      onClick={() => handleRetry(selectedTask, record.chapterIndex)}
+                    >
+                      重试
+                    </Button>
+                  ),
+                },
+              ]}
+            />
+          </>
         )}
+      </Modal>
+
+      <Modal
+        title="删除任务"
+        open={!!deleteTarget}
+        onCancel={() => setDeleteTarget(null)}
+        onOk={confirmDelete}
+        confirmLoading={actionLoading}
+        okButtonProps={{ danger: true }}
+        okText="删除"
+        cancelText="取消"
+        destroyOnHidden
+      >
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Alert
+            type={deleteTarget?.hasRemoteUpload ? 'warning' : 'info'}
+            showIcon
+            message={deleteTarget?.hasRemoteUpload ? '检测到该任务已上传后端/RustFS 数据' : '未检测到该任务已上传后端/RustFS 数据'}
+          />
+          <Radio.Group value={deleteRemote} onChange={(event) => setDeleteRemote(event.target.value)}>
+            <Space direction="vertical">
+              <Radio value={false}>仅删除任务和本地下载文件</Radio>
+              <Radio value disabled={!deleteTarget?.hasRemoteUpload}>同时删除后端 MySQL 数据和 RustFS 文件</Radio>
+            </Space>
+          </Radio.Group>
+        </Space>
       </Modal>
 
       {/* Logs modal */}

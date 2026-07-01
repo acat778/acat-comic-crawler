@@ -71,11 +71,12 @@ router.post('/tasks/:id/cancel', async (req, res) => {
 })
 
 // DELETE /api/crawler/tasks/:id
-// 删除任务，同时清理后端数据和本地下载文件
+// 删除任务，同时清理本地下载文件；deleteRemote=false 时保留后端/RustFS 数据
 router.delete('/tasks/:id', async (req, res) => {
   try {
-    await crawlerService.deleteTask(req.params.id)
-    res.json({ success: true })
+    const deleteRemote = req.query.deleteRemote !== 'false'
+    const result = await crawlerService.deleteTask(req.params.id, { deleteRemote })
+    res.json(result)
   } catch (err) {
     console.error('[Tasks] Delete error:', err.message)
     res.status(500).json({ error: err.message })
@@ -83,10 +84,12 @@ router.delete('/tasks/:id', async (req, res) => {
 })
 
 // POST /api/crawler/tasks/:id/retry
-// 重试失败的任务，先删除已创建的后端章节再重新爬取
+// 重试任务；body.chapterIndexes 为空时重试整本，传入索引数组时仅重试指定章节
 router.post('/tasks/:id/retry', async (req, res) => {
   try {
-    const task = await crawlerService.retryTask(req.params.id)
+    const task = await crawlerService.retryTask(req.params.id, {
+      chapterIndexes: Array.isArray(req.body?.chapterIndexes) ? req.body.chapterIndexes : undefined,
+    })
     res.json(task)
   } catch (err) {
     console.error('[Tasks] Retry error:', err.message)
