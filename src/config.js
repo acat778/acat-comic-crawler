@@ -1,6 +1,6 @@
 export default {
   server: {
-    port: parseInt(process.env.PORT, 10) || 8619,
+    port: parseInt(process.env.PORT, 10) || 8608,
   },
 
   crawler: {
