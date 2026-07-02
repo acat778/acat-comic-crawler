@@ -57,6 +57,24 @@ function isImageBuffer(buffer) {
     buffer[11] === 0x50
 }
 
+function buildCoverImageUrls(client, albumId, album = {}) {
+  const imageBase = client.imageBaseURL
+  if (!imageBase) return []
+
+  const urls = []
+  if (typeof album.image === 'string' && album.image.trim()) {
+    urls.push(album.image.startsWith('http') ? album.image : `${imageBase}${album.image.startsWith('/') ? '' : '/'}${album.image}`)
+  }
+
+  urls.push(
+    `${imageBase}/media/albums/${albumId}.jpg`,
+    `${imageBase}/media/albums/${albumId}_3x4.jpg`,
+    `${imageBase}/media/albums/${albumId}/cover.jpg`,
+  )
+
+  return [...new Set(urls)]
+}
+
 function calculateProgress(chapters) {
   return {
     total: chapters.length,
@@ -197,9 +215,10 @@ async function uploadBackendPage(taskId, chapterId, pageItem, sourceChapterId) {
   return pageItem.backendPageImageId
 }
 
-async function uploadBackendCover(taskId, coverImageUrl) {
+async function uploadBackendCover(taskId, coverImageUrls) {
   const task = storage.getTask(taskId)
-  if (!coverImageUrl) {
+  const urls = Array.isArray(coverImageUrls) ? coverImageUrls.filter(Boolean) : [coverImageUrls].filter(Boolean)
+  if (urls.length === 0) {
     addLog(taskId, 'info', 'No cover image URL, skipping cover upload')
     return null
   }
@@ -209,24 +228,46 @@ async function uploadBackendCover(taskId, coverImageUrl) {
   }
   try {
     const downloadDir = ensureDownloadDir(task.albumTitle)
-    const coverExt = coverImageUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i)?.[1] || 'jpg'
-    const coverPath = path.join(downloadDir, '_cover.' + coverExt)
-    const resp = await axios.get(coverImageUrl, {
-      timeout: 30000,
-      responseType: 'arraybuffer',
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    })
-    const coverBuffer = Buffer.from(resp.data)
-    if (!isImageBuffer(coverBuffer)) {
-      throw new Error(`Downloaded cover is not a valid image (${coverBuffer.length} bytes)`)
+    let coverPath = null
+    let selectedUrl = null
+    let lastError = null
+
+    for (const coverImageUrl of urls) {
+      try {
+        const coverExt = coverImageUrl.match(/\.(jpg|jpeg|png|webp|gif|avif)(\?|$)/i)?.[1] || 'jpg'
+        const resp = await axios.get(coverImageUrl, {
+          timeout: 30000,
+          responseType: 'arraybuffer',
+          validateStatus: () => true,
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        })
+        const coverBuffer = Buffer.from(resp.data)
+        if (resp.status < 200 || resp.status >= 300) {
+          throw new Error(`HTTP ${resp.status}`)
+        }
+        if (!isImageBuffer(coverBuffer)) {
+          throw new Error(`Downloaded cover is not a valid image (${coverBuffer.length} bytes)`)
+        }
+        coverPath = path.join(downloadDir, '_cover.' + coverExt)
+        fs.writeFileSync(coverPath, coverBuffer)
+        selectedUrl = coverImageUrl
+        break
+      } catch (err) {
+        lastError = err
+        addLog(taskId, 'warn', `Cover candidate skipped: ${coverImageUrl} (${err.message})`)
+      }
     }
-    fs.writeFileSync(coverPath, coverBuffer)
+
+    if (!coverPath) {
+      throw lastError || new Error('No valid cover image found')
+    }
+
     const result = await backendApi.uploadCover({
       albumId: task.backendAlbumId,
       filePath: coverPath,
     })
     storage.updateTask(taskId, { backendCoverFileId: result.fileId })
-    addLog(taskId, 'info', `Cover uploaded: ${result.fileId}`)
+    addLog(taskId, 'info', `Cover uploaded: ${result.fileId} (${selectedUrl})`)
     return result.fileId
   } catch (err) {
     addLog(taskId, 'warn', `Cover upload skipped: ${err.message}`)
@@ -362,10 +403,7 @@ export const crawlerService = {
       })
 
       // Upload cover image if available
-      const coverUrl = client.imageBaseURL
-        ? `${client.imageBaseURL}/media/albums/${albumId}/cover.jpg`
-        : null
-      await uploadBackendCover(taskId, coverUrl)
+      await uploadBackendCover(taskId, buildCoverImageUrls(client, albumId, album))
 
       if (chapters.length === 0) {
         addLog(taskId, 'warn', 'No chapters found')
