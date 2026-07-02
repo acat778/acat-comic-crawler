@@ -37,6 +37,26 @@ function hasRemoteUpload(task) {
   ))
 }
 
+function isImageBuffer(buffer) {
+  if (!buffer || buffer.length < 4) return false
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return true
+  if (buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return true
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) return true
+  if (buffer.length >= 12 && buffer[4] === 0x66 && buffer[5] === 0x74 && buffer[6] === 0x79 && buffer[7] === 0x70 &&
+    buffer[8] === 0x61 && buffer[9] === 0x76 && buffer[10] === 0x69 && buffer[11] === 0x66) {
+    return true
+  }
+  return buffer.length >= 12 &&
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x46 &&
+    buffer[8] === 0x57 &&
+    buffer[9] === 0x45 &&
+    buffer[10] === 0x42 &&
+    buffer[11] === 0x50
+}
+
 function calculateProgress(chapters) {
   return {
     total: chapters.length,
@@ -196,7 +216,11 @@ async function uploadBackendCover(taskId, coverImageUrl) {
       responseType: 'arraybuffer',
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     })
-    fs.writeFileSync(coverPath, Buffer.from(resp.data))
+    const coverBuffer = Buffer.from(resp.data)
+    if (!isImageBuffer(coverBuffer)) {
+      throw new Error(`Downloaded cover is not a valid image (${coverBuffer.length} bytes)`)
+    }
+    fs.writeFileSync(coverPath, coverBuffer)
     const result = await backendApi.uploadCover({
       albumId: task.backendAlbumId,
       filePath: coverPath,
