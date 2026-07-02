@@ -1,12 +1,16 @@
 import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
+import nodeHttp from 'http'
+import nodeHttps from 'https'
 import axios from 'axios'
 import config from '../config.js'
 
 const http = axios.create({
   baseURL: config.crawler.apiBaseUrl,
   timeout: 60000,
+  httpAgent: new nodeHttp.Agent({ keepAlive: true }),
+  httpsAgent: new nodeHttps.Agent({ keepAlive: true }),
 })
 
 function unwrap(response) {

@@ -9,6 +9,8 @@
  * that mimic the official mobile app.
  */
 import crypto from 'crypto'
+import http from 'http'
+import https from 'https'
 import axios from 'axios'
 
 const SECRETS = {
@@ -26,6 +28,8 @@ const DOMAIN_SERVERS = [
 
 const UA_ANDROID =
   'Mozilla/5.0 (Linux; Android 9; V1938CT Build/PQ3A.190705.11211812; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.114 Safari/537.36'
+const httpAgent = new http.Agent({ keepAlive: true })
+const httpsAgent = new https.Agent({ keepAlive: true })
 
 /** AES-ECB decrypt with PKCS#7 unpadding (supports 128/256 based on key length) */
 function aesEcbDecrypt(encryptedBase64, keyStr) {
@@ -60,6 +64,8 @@ async function fetchDomains() {
   console.log(`[JMAPI] Fetching domains from ${serverUrl}`)
   const resp = await axios.get(serverUrl, {
     timeout: 10000,
+    httpAgent,
+    httpsAgent,
     headers: { 'User-Agent': UA_ANDROID },
   })
   const encrypted = resp.data?.trim()
@@ -92,6 +98,8 @@ export async function initClient() {
       const url = `${baseURL}/setting`
       const resp = await axios.get(url, {
         timeout: 10000,
+        httpAgent,
+        httpsAgent,
         headers: {
           'User-Agent': UA_ANDROID,
           'Accept-Encoding': 'gzip, deflate',
@@ -142,6 +150,8 @@ class JmApiClient {
 
     const resp = await axios.get(url.toString(), {
       timeout: 15000,
+      httpAgent,
+      httpsAgent,
       headers: {
         'User-Agent': UA_ANDROID,
         'Accept-Encoding': 'gzip, deflate',
@@ -205,6 +215,8 @@ class JmApiClient {
     const url = `${this.baseURL}/chapter_view_template?id=${chapterId}&mode=vertical&page=0&app_img_shunt=1&v=${timestamp}`
     const resp = await axios.get(url, {
       timeout: 10000,
+      httpAgent,
+      httpsAgent,
       headers: {
         'User-Agent': UA_ANDROID,
         'token': md5(`${timestamp}${SECRETS.content}`),

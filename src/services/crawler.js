@@ -1,5 +1,7 @@
 import fs from 'fs'
 import path from 'path'
+import http from 'http'
+import https from 'https'
 import axios from 'axios'
 import { v4 as uuidv4 } from 'uuid'
 import config from '../config.js'
@@ -8,12 +10,26 @@ import { initClient } from './jmcomic-api.js'
 import { backendApi, sha256File } from './backend-api.js'
 import { getAdapter } from '../sites/registry.js'
 import { storage } from '../store/storage.js'
+import { mapLimit, normalizeConcurrency } from './concurrency.js'
 import { DEFAULT_SCRAMBLE_ID, descramble } from './descramble.js'
 
 const activeTasks = new Map()
+const imageConcurrency = normalizeConcurrency(config.crawler.imageConcurrency, 4, 20)
+const imageHttp = axios.create({
+  timeout: 30000,
+  responseType: 'arraybuffer',
+  httpAgent: new http.Agent({ keepAlive: true }),
+  httpsAgent: new https.Agent({ keepAlive: true }),
+})
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+async function sleepAfterImage() {
+  if (config.crawler.imageDelayMs > 0) {
+    await sleep(config.crawler.imageDelayMs)
+  }
 }
 
 function ensureDownloadDir(albumTitle) {
@@ -262,7 +278,7 @@ async function uploadBackendCover(taskId, coverImageUrls) {
     for (const coverImageUrl of urls) {
       try {
         const coverExt = coverImageUrl.match(/\.(jpg|jpeg|png|webp|gif|avif)(\?|$)/i)?.[1] || 'jpg'
-        const resp = await axios.get(coverImageUrl, {
+        const resp = await imageHttp.get(coverImageUrl, {
           timeout: 30000,
           responseType: 'arraybuffer',
           validateStatus: () => true,
@@ -488,53 +504,57 @@ export const crawlerService = {
           const chapterDir = path.join(downloadDir, `${ci + 1}`.padStart(3, '0'))
           if (!fs.existsSync(chapterDir)) fs.mkdirSync(chapterDir, { recursive: true })
 
-          let chapterFailed = 0
-          for (const pageItem of pageItems) {
-            if (controller.signal.aborted) break
-            try {
+          await mapLimit(pageItems, {
+            concurrency: imageConcurrency,
+            signal: controller.signal,
+            worker: async (pageItem) => {
               const ext = pageItem.imageUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i)?.[1] || 'jpg'
               const savePath = path.join(chapterDir, `${String(pageItem.pageNo).padStart(3, '0')}.${ext}`)
 
-              // Download via axios (CDN might not be behind Cloudflare)
-              const resp = await axios.get(pageItem.imageUrl, {
-                timeout: 30000,
-                responseType: 'arraybuffer',
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                  'Referer': client.baseURL,
-                },
-              })
-              let imageBuffer = Buffer.from(resp.data)
-
-              // Descramble JMComic scrambled images (based on photo/chapter ID + filename hash)
-              const imageName = pageItem.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
               try {
-                imageBuffer = await descramble(imageBuffer, {
-                  scrambleId,
-                  imageId: chapterId,
-                  filename: imageName,
+                const resp = await imageHttp.get(pageItem.imageUrl, {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': client.baseURL,
+                  },
                 })
+                let imageBuffer = Buffer.from(resp.data)
+
+                // Descramble JMComic scrambled images (based on photo/chapter ID + filename hash)
+                const imageName = pageItem.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
+                try {
+                  imageBuffer = await descramble(imageBuffer, {
+                    scrambleId,
+                    imageId: chapterId,
+                    filename: imageName,
+                  })
+                } catch (err) {
+                  addLog(taskId, 'warn', `  Descramble failed for ${imageName}: ${err.message}, using original`)
+                }
+
+                fs.writeFileSync(savePath, imageBuffer)
+                const size = fs.statSync(savePath).size
+
+                pageItem.status = 'downloaded'
+                pageItem.localPath = savePath
+                await uploadBackendPage(taskId, backendChapterId, pageItem, chapterId)
+                addLog(taskId, 'info', `  Page ${pageItem.pageNo}: ${(size / 1024).toFixed(1)}KB ✓`)
+                await sleepAfterImage()
               } catch (err) {
-                addLog(taskId, 'warn', `  Descramble failed for ${imageName}: ${err.message}, using original`)
+                pageItem.status = 'failed'
+                pageItem.error = err.message
+                addLog(taskId, 'error', `  Page ${pageItem.pageNo}: ${err.message}`)
               }
+              return pageItem
+            },
+          })
 
-              fs.writeFileSync(savePath, imageBuffer)
-              const size = fs.statSync(savePath).size
-
-              pageItem.status = 'downloaded'
-              pageItem.localPath = savePath
-              await uploadBackendPage(taskId, backendChapterId, pageItem, chapterId)
-              addLog(taskId, 'info', `  Page ${pageItem.pageNo}: ${(size / 1024).toFixed(1)}KB ✓`)
-              await sleep(500)
-            } catch (err) {
-              pageItem.status = 'failed'
-              pageItem.error = err.message
-              chapterFailed++
-              addLog(taskId, 'error', `  Page ${pageItem.pageNo}: ${err.message}`)
-            }
+          if (controller.signal.aborted) {
+            break
           }
 
           // Update chapter status
+          const chapterFailed = pageItems.filter((pageItem) => pageItem.status === 'failed').length
           const finalChapters = storage.getTask(taskId).chapters
           finalChapters[ci] = {
             ...finalChapters[ci],
@@ -662,50 +682,58 @@ export const crawlerService = {
             const chapterDir = path.join(downloadDir, `${ci + 1}`.padStart(3, '0'))
             if (!fs.existsSync(chapterDir)) fs.mkdirSync(chapterDir, { recursive: true })
 
-            let chapterFailed = 0
-            for (const pi of pageImages) {
-              if (controller.signal.aborted) break
-              try {
+            await mapLimit(pageImages, {
+              concurrency: imageConcurrency,
+              signal: controller.signal,
+              worker: async (pi) => {
                 const ext = pi.imageUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i)?.[1] || 'jpg'
                 const savePath = path.join(chapterDir, `${String(pi.pageNo).padStart(3, '0')}.${ext}`)
-                const size = await downloadImage(page, pi.imageUrl, savePath)
 
-                // Descramble JMComic scrambled images (browser download path)
-                let finalSize = size
-                const imageId = extractPhotoIdFromImageUrl(pi.imageUrl)
-                if (imageId) {
-                  try {
-                    const imgBuf = fs.readFileSync(savePath)
-                    const imgName = pi.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
-                    const descrambledBuf = await descramble(imgBuf, {
-                      scrambleId,
-                      imageId,
-                      filename: imgName,
-                    })
-                    fs.writeFileSync(savePath, descrambledBuf)
-                    finalSize = descrambledBuf.length
-                  } catch (err) {
-                    addLog(taskId, 'warn', `  Descramble failed for ${pi.pageNo}: ${err.message}, using original`)
+                try {
+                  const size = await downloadImage(page, pi.imageUrl, savePath)
+
+                  // Descramble JMComic scrambled images (browser download path)
+                  let finalSize = size
+                  const imageId = extractPhotoIdFromImageUrl(pi.imageUrl)
+                  if (imageId) {
+                    try {
+                      const imgBuf = fs.readFileSync(savePath)
+                      const imgName = pi.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
+                      const descrambledBuf = await descramble(imgBuf, {
+                        scrambleId,
+                        imageId,
+                        filename: imgName,
+                      })
+                      fs.writeFileSync(savePath, descrambledBuf)
+                      finalSize = descrambledBuf.length
+                    } catch (err) {
+                      addLog(taskId, 'warn', `  Descramble failed for ${pi.pageNo}: ${err.message}, using original`)
+                    }
+                  } else {
+                    addLog(taskId, 'warn', `  Descramble skipped for ${pi.pageNo}: image ID not found`)
                   }
-                } else {
-                  addLog(taskId, 'warn', `  Descramble skipped for ${pi.pageNo}: image ID not found`)
-                }
 
-                pi.status = 'downloaded'
-                pi.localPath = savePath
-                pi.fileSize = finalSize
-                await uploadBackendPage(taskId, backendChapterId, pi, chapter.url)
-                addLog(taskId, 'info', `  Page ${pi.pageNo}: ${(finalSize / 1024).toFixed(1)}KB ✓`)
-                await sleep(500)
-              } catch (err) {
-                pi.status = 'failed'
-                pi.error = err.message
-                chapterFailed++
-                addLog(taskId, 'error', `  Page ${pi.pageNo}: ${err.message}`)
-              }
+                  pi.status = 'downloaded'
+                  pi.localPath = savePath
+                  pi.fileSize = finalSize
+                  await uploadBackendPage(taskId, backendChapterId, pi, chapter.url)
+                  addLog(taskId, 'info', `  Page ${pi.pageNo}: ${(finalSize / 1024).toFixed(1)}KB ✓`)
+                  await sleepAfterImage()
+                } catch (err) {
+                  pi.status = 'failed'
+                  pi.error = err.message
+                  addLog(taskId, 'error', `  Page ${pi.pageNo}: ${err.message}`)
+                }
+                return pi
+              },
+            })
+
+            if (controller.signal.aborted) {
+              break
             }
 
             // Update chapter status
+            const chapterFailed = pageImages.filter((pi) => pi.status === 'failed').length
             const finalChapters = storage.getTask(taskId).chapters
             finalChapters[ci] = {
               ...finalChapters[ci],

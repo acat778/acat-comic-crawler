@@ -7,6 +7,8 @@ export default {
     downloadDir: process.env.DOWNLOAD_DIR || './downloads',
     dataDir: process.env.DATA_DIR || './data',
     concurrency: parseInt(process.env.CRAWLER_CONCURRENCY, 10) || 2,
+    imageConcurrency: parseInt(process.env.CRAWLER_IMAGE_CONCURRENCY || process.env.CRAWLER_CONCURRENCY, 10) || 4,
+    imageDelayMs: parseInt(process.env.IMAGE_DELAY_MS, 10) || 0,
     requestDelay: parseInt(process.env.REQUEST_DELAY, 10) || 2000,
     apiBaseUrl: process.env.CRAWLER_API_BASE_URL || 'http://localhost:9650/api/comic/crawler',
   },
