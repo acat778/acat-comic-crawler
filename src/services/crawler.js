@@ -8,7 +8,7 @@ import { initClient } from './jmcomic-api.js'
 import { backendApi, sha256File } from './backend-api.js'
 import { getAdapter } from '../sites/registry.js'
 import { storage } from '../store/storage.js'
-import { descramble } from './descramble.js'
+import { DEFAULT_SCRAMBLE_ID, descramble } from './descramble.js'
 
 const activeTasks = new Map()
 
@@ -73,6 +73,33 @@ function buildCoverImageUrls(client, albumId, album = {}) {
   )
 
   return [...new Set(urls)]
+}
+
+function extractPhotoIdFromImageUrl(imageUrl) {
+  return imageUrl.match(/\/media\/photos\/(\d+)\//)?.[1] || null
+}
+
+async function getChapterScrambleId(taskId, client, chapterId) {
+  try {
+    return await client.getScrambleId(chapterId)
+  } catch (err) {
+    addLog(taskId, 'warn', `  Failed to fetch scramble_id for chapter ${chapterId}: ${err.message}; using ${DEFAULT_SCRAMBLE_ID}`)
+    return DEFAULT_SCRAMBLE_ID
+  }
+}
+
+async function getPageScrambleId(taskId, page, chapterId) {
+  try {
+    const scrambleId = await page.evaluate(() => {
+      const scripts = Array.from(document.scripts).map((script) => script.textContent || '').join('\n')
+      return scripts.match(/var\s+scramble_id\s*=\s*(\d+)/)?.[1] || null
+    })
+    if (scrambleId) return scrambleId
+    throw new Error('scramble_id not found in page scripts')
+  } catch (err) {
+    addLog(taskId, 'warn', `  Failed to read scramble_id for chapter ${chapterId}: ${err.message}; using ${DEFAULT_SCRAMBLE_ID}`)
+    return DEFAULT_SCRAMBLE_ID
+  }
 }
 
 function calculateProgress(chapters) {
@@ -455,6 +482,8 @@ export const crawlerService = {
           updatedChapters[ci] = { ...updatedChapters[ci], status: 'processing', pages: pageItems }
           storage.updateTask(taskId, { chapters: updatedChapters })
 
+          const scrambleId = await getChapterScrambleId(taskId, client, chapterId)
+
           // Download each image
           const chapterDir = path.join(downloadDir, `${ci + 1}`.padStart(3, '0'))
           if (!fs.existsSync(chapterDir)) fs.mkdirSync(chapterDir, { recursive: true })
@@ -477,10 +506,14 @@ export const crawlerService = {
               })
               let imageBuffer = Buffer.from(resp.data)
 
-              // Descramble JMComic scrambled images (based on album_id + filename hash)
+              // Descramble JMComic scrambled images (based on photo/chapter ID + filename hash)
               const imageName = pageItem.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
               try {
-                imageBuffer = await descramble(imageBuffer, albumId, imageName)
+                imageBuffer = await descramble(imageBuffer, {
+                  scrambleId,
+                  imageId: chapterId,
+                  filename: imageName,
+                })
               } catch (err) {
                 addLog(taskId, 'warn', `  Descramble failed for ${imageName}: ${err.message}, using original`)
               }
@@ -612,6 +645,7 @@ export const crawlerService = {
             await page.goto(chapter.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
             await sleep(config.crawler.requestDelay)
 
+            const scrambleId = await getPageScrambleId(taskId, page, chapter.url)
             const pageImages = await adapter.getPageImages(page)
             addLog(taskId, 'info', `  Found ${pageImages.length} images`)
 
@@ -637,18 +671,24 @@ export const crawlerService = {
                 const size = await downloadImage(page, pi.imageUrl, savePath)
 
                 // Descramble JMComic scrambled images (browser download path)
-                const task = storage.getTask(taskId)
                 let finalSize = size
-                if (task && task.sourceAlbumId) {
+                const imageId = extractPhotoIdFromImageUrl(pi.imageUrl)
+                if (imageId) {
                   try {
                     const imgBuf = fs.readFileSync(savePath)
                     const imgName = pi.imageUrl.split('/').pop()?.split('?')[0] || 'unknown.jpg'
-                    const descrambledBuf = await descramble(imgBuf, task.sourceAlbumId, imgName)
+                    const descrambledBuf = await descramble(imgBuf, {
+                      scrambleId,
+                      imageId,
+                      filename: imgName,
+                    })
                     fs.writeFileSync(savePath, descrambledBuf)
                     finalSize = descrambledBuf.length
                   } catch (err) {
                     addLog(taskId, 'warn', `  Descramble failed for ${pi.pageNo}: ${err.message}, using original`)
                   }
+                } else {
+                  addLog(taskId, 'warn', `  Descramble skipped for ${pi.pageNo}: image ID not found`)
                 }
 
                 pi.status = 'downloaded'

@@ -7,13 +7,13 @@
  *
  * JMComic 的图片混淆方式：
  *   将原始图片水平切割成若干段（竖条），颠倒排列顺序。
- *   还原时根据 album_id 计算出段数和切分位置，从底部向上读取、从顶部向下重新拼接。
+ *   还原时根据图片所属 photo/chapter ID 计算出段数和切分位置，从底部向上读取、从顶部向下重新拼接。
  *
  * 版本演进：
- *   - aid < 220980：无混淆
- *   - 220980 ≤ aid < 268850：固定 10 段
- *   - 268850 ≤ aid < 421926：基于 MD5 哈希，x=10，段数 ∈ [2, 20]
- *   - aid ≥ 421926：基于 MD5 哈希，x=8，段数 ∈ [2, 16]
+ *   - imageId < scrambleId：无混淆
+ *   - scrambleId ≤ imageId < 268850：固定 10 段
+ *   - 268850 ≤ imageId < 421926：基于 MD5 哈希，x=10，段数 ∈ [2, 20]
+ *   - imageId ≥ 421926：基于 MD5 哈希，x=8，段数 ∈ [2, 16]
  */
 
 import crypto from 'crypto';
@@ -25,6 +25,8 @@ const SCRAMBLE_220980 = 220980;
 const SCRAMBLE_268850 = 268850;
 const SCRAMBLE_421926 = 421926;
 
+export const DEFAULT_SCRAMBLE_ID = SCRAMBLE_220980;
+
 // endregion
 
 // region 段数计算
@@ -32,14 +34,17 @@ const SCRAMBLE_421926 = 421926;
 /**
  * 计算去混淆所需的段数。
  *
- * @param {number|string} albumId - JMComic 专辑 ID
- * @param {string} filename   - 图片文件名（如 "00001.jpg"）
+ * @param {object} params
+ * @param {number|string} params.scrambleId - JMComic 页面返回的 scramble_id
+ * @param {number|string} params.imageId    - 图片所属 photo/chapter ID
+ * @param {string} params.filename          - 图片文件名（如 "00001.jpg"）
  * @returns {number} 段数，0 表示无需去混淆
  */
-export function getSegmentCount(albumId, filename) {
-  const aid = typeof albumId === 'string' ? parseInt(albumId, 10) : albumId;
+export function getSegmentCount({ scrambleId = DEFAULT_SCRAMBLE_ID, imageId, filename }) {
+  const sid = typeof scrambleId === 'string' ? parseInt(scrambleId, 10) : scrambleId;
+  const aid = typeof imageId === 'string' ? parseInt(imageId, 10) : imageId;
 
-  if (isNaN(aid) || aid < SCRAMBLE_220980) {
+  if (isNaN(sid) || isNaN(aid) || aid < sid) {
     return 0; // 无需去混淆
   }
 
@@ -73,22 +78,24 @@ export function getSegmentCount(albumId, filename) {
  *     若 i > 0 ：段高 = move，y_dst += over（跳过顶部余数段）
  *
  * @param {Buffer}  imageBuffer  - 原始混淆图片的二进制数据
- * @param {number|string} albumId - JMComic 专辑 ID
- * @param {string}  filename     - 图片文件名
+ * @param {object}  params       - 去混淆参数
+ * @param {number|string} params.scrambleId - JMComic 页面返回的 scramble_id
+ * @param {number|string} params.imageId    - 图片所属 photo/chapter ID
+ * @param {string}  params.filename         - 图片文件名
  * @param {object}  [options]    - 可选配置
  * @param {string}  [options.format] - 输出格式 (jpeg/png/webp)，默认 jpeg
  * @param {number}  [options.quality] - 输出质量 1-100，默认 95
  * @returns {Promise<Buffer>} 去混淆后的图片二进制数据
  */
-export async function descramble(imageBuffer, albumId, filename, options = {}) {
-  const num = getSegmentCount(albumId, filename);
+export async function descramble(imageBuffer, params = {}) {
+  const num = getSegmentCount(params);
 
   if (num === 0) {
     // 无需去混淆，直接返回原图
     return imageBuffer;
   }
 
-  const { format = 'jpeg', quality = 95 } = options;
+  const { format = 'jpeg', quality = 95 } = params;
 
   // 1. 解码为原始 RGBA 像素
   const { data, info } = await sharp(imageBuffer)
@@ -151,14 +158,12 @@ import fs from 'fs';
  *
  * @param {string}  inputPath   - 混淆图片文件路径
  * @param {string}  outputPath  - 输出路径
- * @param {number|string} albumId - 专辑 ID
- * @param {string}  filename    - 图片文件名
- * @param {object}  [options]   - 同 descramble()
+ * @param {object}  params      - 同 descramble()
  * @returns {Promise<number>} 写入文件的字节数
  */
-export async function descrambleFile(inputPath, outputPath, albumId, filename, options = {}) {
+export async function descrambleFile(inputPath, outputPath, params = {}) {
   const inputBuffer = fs.readFileSync(inputPath);
-  const outputBuffer = await descramble(inputBuffer, albumId, filename, options);
+  const outputBuffer = await descramble(inputBuffer, params);
 
   // 如果输出路径与输入相同则覆盖
   fs.writeFileSync(outputPath, outputBuffer);
